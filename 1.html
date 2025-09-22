@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Three.js Car Runner — Polished</title>
+  <style>
+    html,body{height:100%;width:100%;margin:0;padding:0;overflow:hidden;background:#071028;font-family:Inter,Arial,Helvetica,sans-serif;color:#fff}
+    #gameCanvas{position:fixed;inset:0;display:block}
+    .hud{position:fixed;left:16px;top:16px;z-index:30;display:flex;flex-direction:column;gap:8px}
+    .panel{background:rgba(255,255,255,0.06);padding:8px 12px;border-radius:10px;font-weight:700;backdrop-filter: blur(4px)}
+    .panel small{display:block;font-weight:400;opacity:0.8}
+    .centerUI{
+      position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:40;
+      background:linear-gradient(180deg,#fff,#f2f2f2);color:#111;padding:22px;border-radius:14px;min-width:320px;box-shadow:0 20px 60px rgba(0,0,0,0.6);display:none;
+      text-align:center;
+    }
+    button{padding:10px 14px;border-radius:10px;border:0;background:#1976d2;color:#fff;font-weight:700;cursor:pointer}
+    .instructions{position:fixed;right:16px;top:16px;z-index:30;background:rgba(255,255,255,0.04);padding:10px;border-radius:10px;font-size:14px}
+    .speedBar{width:220px;height:10px;background:rgba(255,255,255,0.06);border-radius:999px;overflow:hidden}
+    .speedFill{height:100%;width:0%;background:linear-gradient(90deg,#00ff7f,#ffcc00)}
+    @media (max-width:800px){ .instructions{display:none} }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+
+  <div class="hud" aria-hidden="true">
+    <div class="panel">Score: <span id="score">0</span> <small>Distance & speed factor</small></div>
+    <div class="panel" style="display:flex;flex-direction:column">
+      <div style="display:flex;align-items:center;gap:8px;justify-content:space-between">
+        <div>Speed: <strong id="speed">0</strong> km/h</div>
+        <div>Lives: <strong id="lives">3</strong></div>
+      </div>
+      <div style="margin-top:8px" class="speedBar"><div id="speedFill" class="speedFill"></div></div>
+    </div>
+    <div class="panel">High: <span id="high">0</span></div>
+  </div>
+
+  <div class="instructions">
+    Controls:<br>
+    ← → : Change lane • ↑ : Accelerate • ↓ : Brake • Space : Nitro
+  </div>
+
+  <div id="startUI" class="centerUI" style="display:flex;flex-direction:column;gap:12px">
+    <h2 style="margin:0">🚗 Car Runner — Polished</h2>
+    <p style="margin:0;color:#333">Avoid traffic, collect distance, and survive as long as you can.</p>
+    <div style="display:flex;gap:10px;justify-content:center">
+      <button id="startBtn">Start</button>
+      <button id="howBtn" style="background:#444">How</button>
+    </div>
+    <small style="color:#666">High score stored locally</small>
+  </div>
+
+  <div id="gameOverUI" class="centerUI" style="display:none;gap:12px">
+    <h2 style="margin:0">💥 Game Over</h2>
+    <div>Score: <strong id="finalScore">0</strong></div>
+    <div id="gameNote" style="color:#444">Good run!</div>
+    <div style="display:flex;gap:10px;justify-content:center">
+      <button id="restartBtn">Play Again</button>
+      <button id="shareBtn" style="background:#666">Share</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+  <script>
+  // ============ Config ============
+  const CONFIG = {
+    laneCount: 3,
+    laneWidth: 3.5,
+    maxBaseSpeed: 60,
+    accel: 55,
+    friction: 20,
+    spawnBase: 1.2,      // seconds
+    spawnMin: 0.45,
+    difficultyTime: 120, // seconds to reach max difficulty
+    nitroBoost: 1.9,
+    nitroDuration: 1.4,
+    startLives: 3,
+    wheelRadius: 0.55
+  };
+
+  // ============ WebAudio (engine + crash) ============
+  class AudioEngine {
+    constructor(){
+      try { this.ctx = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){ this.ctx = null; }
+      this.osc = null; this.gain = null;
+      this.init();
+    }
+    init(){
+      if(!this.ctx) return;
+      this.osc = this.ctx.createOscillator();
+      this.gain = this.ctx.createGain();
+      this.osc.type = 'sawtooth';
+      this.osc.frequency.value = 60;
+      this.gain.gain.value = 0.0001; // start silent
+      this.osc.connect(this.gain); this.gain.connect(this.ctx.destination);
+      this.osc.start();
+    }
+    setPitch(speed){
+      if(!this.ctx) return;
+      const freq = 60 + speed * 8; // tune
+      this.osc.frequency.linearRampToValueAtTime(freq, this.ctx.currentTime + 0.04);
+      // engine volume relative to speed
+      const vol = 0.02 + Math.min(0.15, speed / 1200);
+      this.gain.gain.linearRampToValueAtTime(vol, this.ctx.currentTime + 0.04);
+    }
+    crash(){
+      if(!this.ctx) return;
+      // short noise buffer
+      const buf = this.ctx.createBuffer(1, this.ctx.sampleRate * 0.18, this.ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for(let i=0;i<d.length;i++){ d[i] = (Math.random()*2-1) * Math.exp(-i/d.length*6); }
+      const src = this.ctx.createBufferSource(); src.buffer = buf;
+      const g = this.ctx.createGain(); g.gain.value = 0.7;
+      src.connect(g); g.connect(this.ctx.destination); src.start();
+      setTimeout(()=>{ try{ src.stop(); } catch(e){} }, 180);
+    }
+  }
+  const audio = new AudioEngine();
+
+  // ============ THREE setup ============
+  const canvas = document.getElementById('gameCanvas');
+  const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.setClearColor(0x071028, 1);
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x071028, 0.0009);
+
+  const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 4000);
+  camera.position.set(0, 8, 14);
+
+  function onResize(){ renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); }
+  window.addEventListener('resize', onResize); onResize();
+
+  // lights
+  const hemi = new THREE.HemisphereLight(0xddeeff, 0x101020, 0.9);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+  dir.position.set(20, 40, 10); dir.castShadow = true;
+  dir.shadow.mapSize.set(2048, 2048);
+  scene.add(dir);
+
+  // ============ Road + grass ============
+  // road texture canvas
+  const rc = document.createElement('canvas'); rc.width = 512; rc.height = 512;
+  const rctx = rc.getContext('2d');
+  function drawRoadTexture(){
+    rctx.clearRect(0,0,512,512);
+    // asphalt
+    const g = rctx.createLinearGradient(0,0,0,512); g.addColorStop(0,'#202428'); g.addColorStop(1,'#141616');
+    rctx.fillStyle = g; rctx.fillRect(0,0,512,512);
+    // lane dashes
+    rctx.strokeStyle = '#e9e9e9'; rctx.lineWidth = 10; rctx.setLineDash([44,44]);
+    for(let i=1;i<CONFIG.laneCount;i++){ const x = i*(512/CONFIG.laneCount); rctx.beginPath(); rctx.moveTo(x,12); rctx.lineTo(x,500); rctx.stroke(); }
+    rctx.setLineDash([]);
+    // worn lines
+    for(let i=0;i<16;i++){ rctx.strokeStyle = 'rgba(0,0,0,0.06)'; rctx.lineWidth = Math.random()*2 + 0.5; rctx.beginPath(); rctx.moveTo(Math.random()*512, Math.random()*512); rctx.lineTo(Math.random()*512, Math.random()*512); rctx.stroke(); }
+  }
+  drawRoadTexture();
+  const roadTex = new THREE.CanvasTexture(rc); roadTex.wrapS = roadTex.wrapT = THREE.RepeatWrapping; roadTex.repeat.set(1, 160);
+  const roadGeo = new THREE.PlaneGeometry(CONFIG.laneCount*CONFIG.laneWidth + 10, 6000, 1, 1);
+  const roadMat = new THREE.MeshStandardMaterial({map: roadTex, roughness:1, metalness:0});
+  const road = new THREE.Mesh(roadGeo, roadMat); road.rotation.x = -Math.PI/2; road.receiveShadow = true;
+  scene.add(road);
+
+  // grass left and right
+  const grassWidth = 2000;
+  const grassMat = new THREE.MeshStandardMaterial({color:0x0e6b28, roughness:1});
+  const leftGrass = new THREE.Mesh(new THREE.PlaneGeometry(grassWidth, 6000), grassMat);
+  leftGrass.rotation.x = -Math.PI/2; leftGrass.position.x = - (CONFIG.laneCount*CONFIG.laneWidth)/2 - (grassWidth/2) + 2; leftGrass.position.z = -1200; scene.add(leftGrass);
+  const rightGrass = leftGrass.clone(); rightGrass.position.x = -rightGrass.position.x; scene.add(rightGrass);
+
+  // subtle roadside boxes (to give depth)
+  for(let i=-6;i<60;i++){
+    const z = -i*120 - 60;
+    const box = new THREE.Mesh(new THREE.BoxGeometry(6,8,6), new THREE.MeshStandardMaterial({color:0x0b3b10, roughness:1}));
+    box.position.set(- (CONFIG.laneCount*CONFIG.laneWidth)/2 - 9 + (Math.random()*4-2), 4, z);
+    box.receiveShadow = true; box.castShadow = true; scene.add(box);
+
+    const box2 = box.clone();
+    box2.position.x = -box.position.x; scene.add(box2);
+  }
+
+  // ============ Car builder (with wheel refs) ============
+  function makeCarGroup(color=0xff0000, scale=1){
+    const g = new THREE.Group();
+    // body
+    const body = new THREE.Mesh(new THREE.BoxGeometry(2.6*scale, 0.9*scale, 4.8*scale), new THREE.MeshStandardMaterial({color, metalness:0.25, roughness:0.6}));
+    body.position.y = 0.7*scale; g.add(body);
+    // cabin
+    const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.6*scale, 0.8*scale, 1.9*scale), new THREE.MeshStandardMaterial({color:0x111111, metalness:0.05, roughness:0.7}));
+    cabin.position.set(0, 1.25*scale, 0.1); g.add(cabin);
+    // headlights (emissive) on body front
+    const headMat = new THREE.MeshStandardMaterial({color:0xffffff, emissive:0x222222, emissiveIntensity:0.8});
+    const lh = new THREE.Mesh(new THREE.PlaneGeometry(0.28*scale, 0.1*scale), headMat);
+    lh.position.set(-0.6*scale, 0.95*scale, -2.5*scale); lh.rotation.y = Math.PI/6; g.add(lh);
+    const rh = lh.clone(); rh.position.x = 0.6*scale; rh.rotation.y = -Math.PI/6; g.add(rh);
+    // wheels (store)
+    const wheels = [];
+    const wheelGeo = new THREE.CylinderGeometry(CONFIG.wheelRadius*scale, CONFIG.wheelRadius*scale, 0.44*scale, 20);
+    const wheelMat = new THREE.MeshStandardMaterial({color:0x050505, roughness:0.7});
+    const positions = [[1.05*scale, 0.35*scale, 1.6*scale],[-1.05*scale,0.35*scale,1.6*scale],[1.05*scale,0.35*scale,-1.6*scale],[-1.05*scale,0.35*scale,-1.6*scale]];
+    for(const p of positions){
+      const w = new THREE.Mesh(wheelGeo, wheelMat);
+      w.rotation.z = Math.PI/2; w.position.set(p[0], p[1], p[2]);
+      g.add(w); wheels.push(w);
+    }
+    g.userData = {wheels};
+    g.castShadow = true; g.receiveShadow = false;
+    return g;
+  }
+
+  // Player
+  const player = makeCarGroup(0xff2b2b, 1);
+  player.position.set(0, 0, -45);
+  scene.add(player);
+
+  // add headlights lights (spotlights) to player
+  const leftSpot = new THREE.SpotLight(0xfff7e6, 1.2, 260, Math.PI/7, 0.4, 1);
+  leftSpot.position.set(-0.6, 1.6, -42); leftSpot.target.position.set(-0.6, 0, -260); scene.add(leftSpot); scene.add(leftSpot.target);
+  const rightSpot = leftSpot.clone(); rightSpot.position.x = 0.6; rightSpot.target.position.x = 0.6; scene.add(rightSpot); scene.add(rightSpot.target);
+
+  // enemies & list
+  const enemies = [];
+  function makeEnemy(){
+    const color = new THREE.Color(Math.random()*0.8 + 0.1, Math.random()*0.8 + 0.1, Math.random()*0.8 + 0.1);
+    const g = makeCarGroup(color, 1.0);
+    g.rotation.y = Math.PI; // face player
+    scene.add(g);
+    enemies.push(g);
+    return g;
+  }
+
+  // coins (optional) - we'll keep to distance scoring, skip pickups to keep code focused.
+
+  // ============ Game state ============
+  const state = {
+    laneIndex: Math.floor(CONFIG.laneCount/2),
+    targetX: 0,
+    speed: 4,            // initial small speed
+    maxSpeed: CONFIG.maxBaseSpeed,
+    nitroTime: 0,
+    lives: CONFIG.startLives,
+    score: 0,
+    running: false,
+    paused: false,
+    spawnTimer: CONFIG.spawnBase,
+    elapsed: 0,
+    high: Number(localStorage.getItem('car_high') || 0),
+    distanceAccumulator: 0
+  };
+
+  // UI refs
+  const scoreEl = document.getElementById('score');
+  const speedEl = document.getElementById('speed');
+  const speedFill = document.getElementById('speedFill');
+  const livesEl = document.getElementById('lives');
+  const highEl = document.getElementById('high');
+  highEl.textContent = state.high;
+
+  const startUI = document.getElementById('startUI');
+  const startBtn = document.getElementById('startBtn');
+  const howBtn = document.getElementById('howBtn');
+  const gameOverUI = document.getElementById('gameOverUI');
+  const finalScore = document.getElementById('finalScore');
+  const gameNote = document.getElementById('gameNote');
+  const restartBtn = document.getElementById('restartBtn');
+  const shareBtn = document.getElementById('shareBtn');
+
+  // ============ Controls ============
+  const keys = {};
+  window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+    if(e.code === 'KeyP') togglePause();
+  });
+  window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+  // mobile: tap left/right
+  function setupTap(el, onDown){ let pressing=false; const down=(ev)=>{ pressing=true; onDown(); ev.preventDefault(); }; const up=()=>{ pressing=false; }; el.addEventListener('touchstart', down); el.addEventListener('mousedown', down); el.addEventListener('touchend', up); el.addEventListener('mouseup', up); }
+
+  // lane move (debounced)
+  let lastLaneMove = 0;
+  function moveLane(dir){
+    const now = performance.now();
+    if(now - lastLaneMove < 140) return;
+    lastLaneMove = now;
+    state.laneIndex = Math.max(0, Math.min(CONFIG.laneCount-1, state.laneIndex + dir));
+    state.targetX = (state.laneIndex - (CONFIG.laneCount-1)/2) * CONFIG.laneWidth;
+    // small audio ping
+    if(audio.ctx) audio.ctx.resume().then(()=>{}).catch(()=>{});
+  }
+
+  // nitro
+  function useNitro(){
+    if(state.nitroTime <= 0){
+      state.nitroTime = CONFIG.nitroDuration;
+    }
+  }
+
+  // ============ Camera follow (closer cinematic) ============
+  function updateCamera(){
+    const target = new THREE.Vector3(player.position.x + 1.8, player.position.y + 6.0, player.position.z + 12.0);
+    camera.position.lerp(target, 0.08);
+    camera.lookAt(player.position.x, player.position.y + 1.0, player.position.z - 30);
+    // tilt slightly
+    camera.rotation.z = THREE.MathUtils.lerp(camera.rotation.z, (player.position.x - state.targetX) * -0.02, 0.08);
+  }
+
+  // ============ Collision detection ============
+  function checkCollision(){
+    const pbox = new THREE.Box3().setFromObject(player);
+    for(const e of enemies){
+      const bbox = new THREE.Box3().setFromObject(e);
+      if(pbox.intersectsBox(bbox)) return e;
+    }
+    return null;
+  }
+
+  // ============ Difficulty functions ============
+  function difficultyFactor(){
+    // 1..2 over difficultyTime seconds
+    return 1 + Math.min(1, state.elapsed / CONFIG.difficultyTime);
+  }
+
+  // ============ Spawn & update ============
+  function spawnEnemyIfNeeded(){
+    if(state.spawnTimer <= 0){
+      const enemy = makeEnemy();
+      const lane = Math.floor(Math.random() * CONFIG.laneCount);
+      const laneX = (lane - (CONFIG.laneCount-1)/2) * CONFIG.laneWidth;
+      enemy.position.set(laneX, 0, player.position.z - (280 + Math.random()*360));
+      enemy.userData.speed = (8 + Math.random()*20) * difficultyFactor(); // base enemy speed
+      enemy.userData.lane = lane;
+      state.spawnTimer = Math.max(CONFIG.spawnMin, CONFIG.spawnBase - state.elapsed * 0.004); // slight decrease of spawn delay
+    }
+  }
+
+  // ============ Particles (simple) ============
+  const particles = [];
+  function spawnCrashParticles(pos, color=0xff3333){
+    const group = {meshes:[], life:1.2};
+    for(let i=0;i<18;i++){
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.08,6,6), new THREE.MeshStandardMaterial({color}));
+      m.position.copy(pos);
+      m.userData.vel = new THREE.Vector3((Math.random()*2-1)*4, Math.random()*2+1, (Math.random()*2-1)*4);
+      scene.add(m); group.meshes.push(m);
+    }
+    particles.push(group);
+  }
+
+  // ============ Game loop ============
+  let lastT = performance.now() / 1000;
+  function animate(){
+    const now = performance.now() / 1000;
+    let dt = Math.min(0.05, now - lastT); lastT = now;
+    if(state.running && !state.paused){
+      state.elapsed += dt;
+      // difficulty & spawn timer
+      state.spawnTimer -= dt;
+
+      // controls
+      if((keys['ArrowLeft'] || keys['KeyA'])) { moveLane(-1); keys['ArrowLeft']=false; keys['KeyA']=false; }
+      if((keys['ArrowRight'] || keys['KeyD'])) { moveLane(1); keys['ArrowRight']=false; keys['KeyD']=false; }
+      // speed control
+      if(keys['ArrowUp'] || keys['KeyW']) state.speed += CONFIG.accel * dt;
+      if(keys['ArrowDown'] || keys['KeyS']) state.speed -= CONFIG.accel * dt;
+      if(!keys['ArrowUp'] && !keys['ArrowDown'] && !keys['KeyW'] && !keys['KeyS']) state.speed = Math.max(0, state.speed - CONFIG.friction * dt);
+
+      // nitro
+      if((keys['Space'] || keys['KeyN']) && state.nitroTime <= 0){ useNitro(); }
+      if(state.nitroTime > 0){ state.nitroTime -= dt; }
+
+      // clamp speed relative to difficulty
+      const maxS = state.maxSpeed * difficultyFactor();
+      state.speed = Math.max(0, Math.min(maxS, state.speed));
+
+      // forward motion
+      const speedFactor = (state.nitroTime > 0) ? CONFIG.nitroBoost : 1;
+      const forward = state.speed * dt * 1.6 * speedFactor;
+      player.position.z -= forward;
+      state.distanceAccumulator += forward;
+      state.score = Math.floor(state.distanceAccumulator * 0.12 + state.elapsed * 0.6); // mix distance & time
+
+      // wheel rotation based on forward distance
+      const wheels = player.userData.wheels;
+      if(wheels && wheels.length){
+        const rotationAmount = forward / (CONFIG.wheelRadius * 0.9);
+        for(const w of wheels) w.rotation.x -= rotationAmount;
+      }
+
+      // smooth lane x
+      const desiredX = (state.laneIndex - (CONFIG.laneCount-1)/2) * CONFIG.laneWidth;
+      state.targetX = desiredX;
+      player.position.x += (state.targetX - player.position.x) * 0.22;
+      // little body tilt when turning
+      player.rotation.z = THREE.MathUtils.lerp(player.rotation.z, (player.position.x - state.targetX) * -0.08, 0.12);
+
+      // update enemies
+      for(let i=enemies.length-1;i>=0;i--){
+        const e = enemies[i];
+        e.position.z += e.userData.speed * dt;
+        // small lateral drift on some enemies
+        if(Math.abs(e.position.x) < 7 && Math.random() < 0.002) e.position.x += (Math.random()*2-1) * 0.06;
+        // wheel spin for enemies
+        if(e.userData.wheels){
+          const ws = e.userData.wheels;
+          const rot = (e.userData.speed * dt) / (CONFIG.wheelRadius * 0.9);
+          for(const w of ws) w.rotation.x -= rot;
+        }
+        // remove if passed
+        if(e.position.z > player.position.z + 90){ scene.remove(e); enemies.splice(i,1); state.score += 1; }
+      }
+
+      // spawn
+      spawnEnemyIfNeeded();
+
+      // particles update
+      for(let i=particles.length-1;i>=0;i--){
+        const p = particles[i];
+        p.life -= dt;
+        p.meshes.forEach(m => {
+          m.position.addScaledVector(m.userData.vel, dt);
+          m.userData.vel.multiplyScalar(0.96);
+        });
+        if(p.life <= 0){ p.meshes.forEach(m=>scene.remove(m)); particles.splice(i,1); }
+      }
+
+      // collision
+      const hit = checkCollision();
+      if(hit){
+        audio.crash();
+        spawnCrashParticles(player.position.clone(), 0xff6644);
+        state.lives -= 1;
+        // remove the colliding enemy
+        const idx = enemies.indexOf(hit); if(idx >= 0){ scene.remove(hit); enemies.splice(idx,1); }
+        if(state.lives <= 0){
+          // game over
+          state.running = false;
+          onGameOver();
+        } else {
+          // small bounce-back
+          player.position.z += 10;
+        }
+      }
+
+      // update engine sound pitch
+      audio.setPitch(state.speed);
+
+      // road texture scroll - forward (plus sign)
+      roadTex.offset.y += (state.speed / state.maxSpeed) * 0.02 * (state.nitroTime > 0 ? 1.6 : 1);
+
+      // update headlights to follow car
+      leftSpot.position.set(player.position.x - 0.6, player.position.y + 1.6, player.position.z + 2);
+      leftSpot.target.position.set(player.position.x - 0.6, 0, player.position.z - 260);
+      rightSpot.position.set(player.position.x + 0.6, player.position.y + 1.6, player.position.z + 2);
+      rightSpot.target.position.set(player.position.x + 0.6, 0, player.position.z - 260);
+
+      // HUD updates
+      scoreEl.textContent = Math.floor(state.score);
+      speedEl.textContent = Math.floor(state.speed * (state.nitroTime > 0 ? 1.8 : 1));
+      speedFill.style.width = Math.min(100, (state.speed / state.maxSpeed * 100)) + '%';
+      livesEl.textContent = state.lives;
+    }
+
+    // camera follow
+    updateCamera();
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(animate);
+  }
+
+  // ============ Game flow ============
+  function startGame(){
+    // reset values
+    state.running = true; state.paused = false; state.elapsed = 0; state.score = 0; state.distanceAccumulator = 0;
+    state.speed = 8; state.lives = CONFIG.startLives; state.spawnTimer = CONFIG.spawnBase;
+    state.nitroTime = 0;
+    state.laneIndex = Math.floor(CONFIG.laneCount / 2);
+    state.targetX = (state.laneIndex - (CONFIG.laneCount-1)/2) * CONFIG.laneWidth;
+    // remove existing enemies
+    enemies.forEach(e => scene.remove(e)); enemies.length = 0;
+    particles.forEach(p=>p.meshes.forEach(m=>scene.remove(m))); particles.length = 0;
+    startUI.style.display = 'none';
+    gameOverUI.style.display = 'none';
+    lastT = performance.now()/1000;
+    // resume audio context if blocked
+    if(audio.ctx) audio.ctx.resume().catch(()=>{});
+  }
+
+  function onGameOver(){
+    finalScore.textContent = Math.floor(state.score);
+    const note = (state.score > state.high) ? 'New High Score! 🎉' : 'Nice run — try again!';
+    gameNote.textContent = note;
+    if(state.score > state.high){ state.high = Math.floor(state.score); localStorage.setItem('car_high', state.high); highEl.textContent = state.high; }
+    gameOverUI.style.display = 'flex';
+  }
+
+  function restartGame(){ startUI.style.display = 'flex'; gameOverUI.style.display = 'none'; state.running = false; }
+
+  startBtn.onclick = startGame;
+  howBtn.onclick = ()=>alert('Arrow keys to move and control speed. Space for nitro. Avoid oncoming cars. Survive to score higher.');
+  restartBtn.onclick = startGame;
+  shareBtn.onclick = ()=>{
+    if(navigator.share) navigator.share({title:'Car Runner Score', text:'I scored '+Math.floor(state.score)+' in Car Runner!', url:location.href}).catch(()=>{});
+    else alert('Share this URL: ' + location.href);
+  };
+
+  // keyboard quick lane debouncing
+  window.addEventListener('keydown', e=>{
+    if(e.code === 'ArrowLeft' || e.code === 'KeyA') { moveLane(-1); }
+    if(e.code === 'ArrowRight' || e.code === 'KeyD') { moveLane(1); }
+    if(e.code === 'Space') { useNitro(); }
+  });
+
+  // start UI visible
+  startUI.style.display = 'flex';
+
+  // kick off animation loop
+  animate();
+  </script>
+</body>
+</html>
