@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ProtoTech Codathon: 3D Car Runner</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        canvas { display: block; }
+        .hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-size: 24px;
+            text-shadow: 2px 2px 4px #000000;
+            z-index: 100;
+        }
+        .overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background-color: rgba(0, 0, 0, 0.75);
+            color: white;
+            padding: 40px;
+            border-radius: 10px;
+            font-size: 2em;
+            text-align: center;
+            z-index: 200;
+            border: 2px solid white;
+        }
+        .overlay h1 { margin: 0 0 10px 0; font-size: 1.5em; }
+        .overlay p { margin: 0; font-size: 0.8em; }
+        .overlay button {
+            margin-top: 20px;
+            padding: 10px 20px;
+            font-size: 0.8em;
+            cursor: pointer;
+            border: 2px solid white;
+            background: none;
+            color: white;
+            border-radius: 5px;
+            transition: background-color 0.3s, color 0.3s;
+        }
+        .overlay button:hover { background-color: white; color: black; }
+    </style>
+</head>
+<body>
+    <div class="hud">
+        <div>Score: <span id="score">0</span></div>
+        <div>Speed: <span id="speed">0</span></div>
+    </div>
+    
+    <div id="startScreen" class="overlay">
+        <h1>3D Car Runner</h1>
+        <p>Use [↑][↓][←][→] to drive.</p>
+        <button id="startButton">Click to Start</button>
+    </div>
+
+    <div id="gameOverScreen" class="overlay" style="display: none;">
+        <h1>GAME OVER</h1>
+        <p id="finalScore"></p>
+        <button id="restartButton">Restart</button>
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.158.0/build/three.module.js"
+        }
+    }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+
+        // ## Level 1: Scene, Camera, and Renderer Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+        scene.fog = new THREE.Fog(0x87CEEB, 50, 150);
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        scene.add(new THREE.AmbientLight(0xffffff, 0.6), dirLight);
+
+        // ## Game State and Constants
+        let playerCar, playerSpeed, score, gameOver, animationId;
+        const keysPressed = {};
+        const activeEnemies = [], enemyPool = [];
+        const activeTrees = [], treePool = [];
+        let lastEnemySpawnTime = 0, lastTreeSpawnTime = 0;
+
+        const ROAD_WIDTH = 10, ROAD_LENGTH = 100, LANE_WIDTH = ROAD_WIDTH / 3;
+        const MAX_SPEED = 0.5, ACCELERATION = 0.008, FRICTION = 0.98;
+        const STEER_SPEED = 0.15, TILT_AMOUNT = 0.05;
+
+        // ## DOM Elements
+        const scoreElement = document.getElementById('score');
+        const speedElement = document.getElementById('speed');
+        const startScreen = document.getElementById('startScreen');
+        const gameOverScreen = document.getElementById('gameOverScreen');
+        const finalScoreElement = document.getElementById('finalScore');
+        const startButton = document.getElementById('startButton');
+        const restartButton = document.getElementById('restartButton');
+        
+        // ## Level 10 (Bonus): Sound Effects
+        let audioListener, engineSound, crashSound;
+        let soundsReady = false;
+
+        function initAudio() {
+            audioListener = new THREE.AudioListener();
+            camera.add(audioListener);
+            const audioLoader = new THREE.AudioLoader();
+            
+            engineSound = new THREE.PositionalAudio(audioListener);
+            crashSound = new THREE.Audio(audioListener);
+
+            audioLoader.load('https://threejs.org/examples/sounds/engine.ogg', (buffer) => {
+                engineSound.setBuffer(buffer);
+                engineSound.setLoop(true);
+                engineSound.setVolume(0.5);
+            });
+            playerCar.add(engineSound);
+
+            audioLoader.load('https://threejs.org/examples/sounds/sounds.ogg', (buffer) => {
+                crashSound.setBuffer(buffer);
+                crashSound.setVolume(1.0);
+            });
+            soundsReady = true;
+        }
+
+        // ## Level 2: Build the Player Car
+        function createCarMesh() {
+            const car = new THREE.Group();
+            const bodyGeo = new THREE.BoxGeometry(2, 0.8, 4);
+            const bodyMat = new THREE.MeshStandardMaterial({ color: 0xff0000, metalness: 0.5, roughness: 0.5 });
+            const body = new THREE.Mesh(bodyGeo, bodyMat);
+            body.castShadow = true;
+            car.add(body);
+
+            const cabinGeo = new THREE.BoxGeometry(1.6, 0.7, 2);
+            const cabinMat = new THREE.MeshStandardMaterial({ color: 0x444444, metalness: 0.5, roughness: 0.5 });
+            const cabin = new THREE.Mesh(cabinGeo, cabinMat);
+            cabin.position.set(0, 0.75, -0.5);
+            cabin.castShadow = true;
+            car.add(cabin);
+
+            // ## Level 10: Final Polish (Headlights)
+            const headlightGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.1, 16);
+            const headlightMat = new THREE.MeshStandardMaterial({ color: 0xffff00, emissive: 0xffff00, emissiveIntensity: 1 });
+            const leftLight = new THREE.Mesh(headlightGeo, headlightMat);
+            leftLight.position.set(-0.7, 0, 2.05);
+            leftLight.rotation.z = Math.PI / 2;
+            car.add(leftLight);
+            const rightLight = leftLight.clone();
+            rightLight.position.x = 0.7;
+            car.add(rightLight);
+
+            // ## Level 10 (Bonus): Wheel Animation Setup
+            const wheelGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.2, 32);
+            const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+            const wheelPositions = [
+                { x: -1.1, y: -0.2, z: 1.3 }, { x: 1.1, y: -0.2, z: 1.3 },
+                { x: -1.1, y: -0.2, z: -1.3 }, { x: 1.1, y: -0.2, z: -1.3 }
+            ];
+            car.userData.wheels = [];
+            wheelPositions.forEach(pos => {
+                const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+                wheel.rotation.x = Math.PI / 2;
+                wheel.position.set(pos.x, pos.y, pos.z);
+                wheel.castShadow = true;
+                car.add(wheel);
+                car.userData.wheels.push(wheel);
+            });
+            car.position.y = 0.6;
+            return car;
+        }
+
+        // ## Level 6: Enemy Cars
+        function getEnemyCar() {
+            let enemyCar = enemyPool.length > 0 ? enemyPool.pop() : createCarMesh();
+            enemyCar.visible = true;
+            scene.add(enemyCar);
+            activeEnemies.push(enemyCar);
+            return enemyCar;
+        }
+
+        function createTree() {
+            const tree = new THREE.Group();
+            const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.3, 2, 8), new THREE.MeshStandardMaterial({ color: 0x8B4513 }));
+            trunk.castShadow = true;
+            const leaves = new THREE.Mesh(new THREE.SphereGeometry(1.5, 8, 6), new THREE.MeshStandardMaterial({ color: 0x228B22 }));
+            leaves.position.y = 2;
+            leaves.castShadow = true;
+            tree.add(trunk, leaves);
+            return tree;
+        }
+
+        function getTree() {
+            let tree = treePool.length > 0 ? treePool.pop() : createTree();
+            tree.visible = true;
+            scene.add(tree);
+            activeTrees.push(tree);
+            return tree;
+        }
+        
+        // ## Level 3: Environment
+        const roadSegments = [];
+        function createEnvironment() {
+            for (let i = 0; i < 2; i++) {
+                const roadMat = new THREE.MeshLambertMaterial({ color: 0x333333 });
+                const road = new THREE.Mesh(new THREE.PlaneGeometry(ROAD_WIDTH, ROAD_LENGTH), roadMat);
+                road.rotation.x = -Math.PI / 2;
+                road.position.z = -i * ROAD_LENGTH;
+                road.receiveShadow = true;
+                scene.add(road);
+                roadSegments.push(road);
+                
+                // Dashed Center Line
+                const canvas = document.createElement('canvas');
+                canvas.width = 16; canvas.height = ROAD_LENGTH;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#FFF';
+                for (let y = 0; y < ROAD_LENGTH; y += 4) { ctx.fillRect(6, y, 4, 2); }
+                const lineTexture = new THREE.CanvasTexture(canvas);
+                const line = new THREE.Mesh(new THREE.PlaneGeometry(0.5, ROAD_LENGTH), new THREE.MeshBasicMaterial({ map: lineTexture, transparent: true }));
+                line.rotation.x = -Math.PI / 2;
+                line.position.y = 0.01;
+                road.add(line); // Attach line to road segment
+
+                const grass = new THREE.Mesh(new THREE.PlaneGeometry(100, ROAD_LENGTH), new THREE.MeshLambertMaterial({ color: 0x008800 }));
+                grass.rotation.x = -Math.PI / 2;
+                grass.position.set(0, -0.01, -i * ROAD_LENGTH);
+                scene.add(grass);
+            }
+        }
+
+        // ## Game Logic & Reset
+        function resetGame() {
+            score = 0; playerSpeed = 0; gameOver = false; lastEnemySpawnTime = 0;
+            
+            playerCar.position.set(0, 0.6, 5);
+            playerCar.rotation.set(0, 0, 0);
+
+            [...activeEnemies, ...activeTrees].forEach(obj => {
+                obj.visible = false;
+                scene.remove(obj);
+                (obj.userData.isEnemy ? enemyPool : treePool).push(obj);
+            });
+            activeEnemies.length = 0; activeTrees.length = 0;
+
+            gameOverScreen.style.display = 'none';
+
+            if (soundsReady && engineSound && !engineSound.isPlaying) engineSound.play();
+            if (animationId) cancelAnimationFrame(animationId);
+            animate(0);
+        }
+
+        // ## Level 5: Car Controls
+        function handleControls() {
+            let targetTilt = 0;
+            if (keysPressed['ArrowUp'] || keysPressed['w']) playerSpeed += ACCELERATION;
+            else if (keysPressed['ArrowDown'] || keysPressed['s']) playerSpeed -= ACCELERATION * 2;
+            else playerSpeed *= FRICTION;
+            playerSpeed = Math.max(-MAX_SPEED / 2, Math.min(MAX_SPEED, playerSpeed));
+
+            if (keysPressed['ArrowLeft'] || keysPressed['a']) {
+                playerCar.position.x -= STEER_SPEED;
+                targetTilt = TILT_AMOUNT;
+            }
+            if (keysPressed['ArrowRight'] || keysPressed['d']) {
+                playerCar.position.x += STEER_SPEED;
+                targetTilt = -TILT_AMOUNT;
+            }
+
+            playerCar.position.x = THREE.MathUtils.clamp(playerCar.position.x, -ROAD_WIDTH / 2 + 1, ROAD_WIDTH / 2 - 1);
+            playerCar.rotation.z = THREE.MathUtils.lerp(playerCar.rotation.z, targetTilt, 0.1);
+        }
+
+        // ## Level 9: Difficulty & Spawning
+        function updateGame(time) {
+            roadSegments.forEach(road => {
+                if (road.position.z > playerCar.position.z + ROAD_LENGTH / 2) {
+                    road.position.z -= ROAD_LENGTH * 2;
+                }
+            });
+            
+            const spawnRate = Math.max(300, 2000 - score * 5);
+            if (time - lastEnemySpawnTime > spawnRate) {
+                spawnEnemy(time);
+                lastEnemySpawnTime = time;
+            }
+            if(time - lastTreeSpawnTime > 500) {
+                spawnTree();
+                lastTreeSpawnTime = time;
+            }
+
+            // Update active objects
+            [...activeEnemies, ...activeTrees].forEach((obj, index) => {
+                obj.position.z += obj.userData.speed;
+                if(obj.userData.drift) obj.position.x += obj.userData.drift;
+
+                if (obj.position.z > playerCar.position.z + 20) {
+                    obj.visible = false;
+                    scene.remove(obj);
+                    const array = obj.userData.isEnemy ? activeEnemies : activeTrees;
+                    const pool = obj.userData.isEnemy ? enemyPool : treePool;
+                    pool.push(obj);
+                    array.splice(index, 1);
+                }
+            });
+            
+            // ==================== FIX START ====================
+            // Move the world towards the player for a forward motion illusion
+            const worldSpeed = playerSpeed * 1.5;
+            [...activeEnemies, ...activeTrees, ...roadSegments].forEach(obj => obj.position.z += worldSpeed);
+            // ===================== FIX END =====================
+
+            // ## Level 8: HUD
+            if (!gameOver) {
+                score += Math.abs(playerSpeed) * 2;
+                scoreElement.innerText = Math.floor(score);
+                speedElement.innerText = (Math.abs(playerSpeed) * 200).toFixed(0);
+            }
+            
+            // Wheel Animation
+            playerCar.userData.wheels.forEach(wheel => wheel.rotation.x -= playerSpeed * 0.5);
+
+            // Engine Sound Pitch
+            if (soundsReady && engineSound) engineSound.setPlaybackRate(0.5 + Math.abs(playerSpeed / MAX_SPEED) * 1.5);
+        }
+        
+        function spawnEnemy(time) {
+            const lane = Math.floor(Math.random() * 3) - 1;
+            const spawnX = lane * LANE_WIDTH;
+            
+            if (activeEnemies.some(car => Math.abs(car.position.x - spawnX) < 1 && car.position.z < playerCar.position.z - 50)) return;
+
+            const enemyCar = getEnemyCar();
+            enemyCar.children[0].material.color.setHSL(Math.random(), 0.6, 0.5); // Random non-red color
+            enemyCar.position.set(spawnX, 0.6, playerCar.position.z - 100);
+            enemyCar.rotation.y = Math.PI;
+            
+            const difficulty = Math.min(score / 500, 1);
+            enemyCar.userData.speed = 0.1 + difficulty * 0.2 + Math.random() * 0.1;
+            enemyCar.userData.drift = (Math.random() < 0.2) ? (Math.random() - 0.5) * 0.01 : 0; // Lane drift
+            enemyCar.userData.isEnemy = true;
+        }
+
+        function spawnTree() {
+            const side = Math.random() < 0.5 ? -1 : 1;
+            const x = side * (ROAD_WIDTH / 2 + Math.random() * 5 + 3);
+            const tree = getTree();
+            tree.position.set(x, 1, playerCar.position.z - 120);
+            tree.userData.speed = 0;
+            tree.userData.isEnemy = false;
+        }
+
+        // ## Level 7: Collision Detection
+        function checkCollisions() {
+            const playerBox = new THREE.Box3().setFromObject(playerCar);
+            for (const enemy of activeEnemies) {
+                if (playerBox.intersectsBox(new THREE.Box3().setFromObject(enemy))) {
+                    gameOver = true;
+                    if (soundsReady) {
+                        engineSound.stop();
+                        crashSound.play();
+                    }
+                    finalScoreElement.innerText = `Final Score: ${Math.floor(score)}`;
+                    gameOverScreen.style.display = 'flex';
+                    break;
+                }
+            }
+        }
+
+        // ## Main Animation Loop
+        function animate(time) {
+            if (gameOver) return;
+            animationId = requestAnimationFrame(animate);
+
+            handleControls();
+            updateGame(time);
+            checkCollisions();
+            
+            // ## Level 4: Camera Movement
+            const cameraTargetPosition = new THREE.Vector3(playerCar.position.x * 0.5, playerCar.position.y + 5, playerCar.position.z + 10);
+            camera.position.lerp(cameraTargetPosition, 0.1);
+            camera.lookAt(playerCar.position.x, playerCar.position.y, playerCar.position.z - 5);
+            
+            renderer.render(scene, camera);
+        }
+
+        // ## Initialization and Event Listeners
+        function init() {
+            createEnvironment();
+            playerCar = createCarMesh();
+            scene.add(playerCar);
+            
+            window.addEventListener('keydown', (e) => { keysPressed[e.key] = true; });
+            window.addEventListener('keyup', (e) => { keysPressed[e.key] = false; });
+            restartButton.addEventListener('click', resetGame);
+            startButton.addEventListener('click', () => {
+                startScreen.style.display = 'none';
+                initAudio();
+                resetGame();
+            });
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+        
+        init();
+    </script>
+</body>
+</html>
